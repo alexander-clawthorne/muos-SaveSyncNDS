@@ -27,8 +27,10 @@ local CANCEL_AFTER = 3      -- seconds before B will abort a running job
 
 -- Used only when config.ini is missing or unreadable.
 local DEFAULT_TARGETS = {
-    { name = "3DS", ip = "192.168.1.10" },
-    { name = "DSi XL", ip = "192.168.1.11" },
+    { name = "3DS", type = "ftp", ip = "192.168.1.10" },
+    { name = "DSi XL", type = "ftp", ip = "192.168.1.11" },
+    -- An empty path means "find any inserted TWiLight card".
+    { name = "DSi card", type = "sd", path = "" },
 }
 
 local appDir = love.filesystem.getSource()
@@ -99,7 +101,18 @@ local function targetName()
 end
 
 local function targetIp()
-    return currentTarget().ip
+    return currentTarget().ip or ""
+end
+
+local function targetIsCard()
+    return currentTarget().type == "sd"
+end
+
+-- What gets handed to the backend as <where>: an IP, or sd:[path].
+local function targetWhere()
+    local t = currentTarget()
+    if t.type == "sd" then return "sd:" .. (t.path or "") end
+    return t.ip or ""
 end
 
 -- Short key used in backup filenames. "3DS" -> "3ds", "DSi XL" -> "dsixl".
@@ -141,8 +154,14 @@ local function loadConfig()
 
     for i = 1, highest do
         local entry = byIndex[i]
-        if entry and entry.ip and entry.ip ~= "" then
-            targets[#targets + 1] = { name = entry.name or ("Target " .. i), ip = entry.ip }
+        if entry then
+            if entry.type == "sd" then
+                targets[#targets + 1] = { name = entry.name or ("Card " .. i),
+                                          type = "sd", path = entry.path or "" }
+            elseif entry.ip and entry.ip ~= "" then
+                targets[#targets + 1] = { name = entry.name or ("Target " .. i),
+                                          type = "ftp", ip = entry.ip }
+            end
         end
     end
     if #targets == 0 and legacyIp then
@@ -160,7 +179,12 @@ local function saveConfig()
     handle:write("target=", targetIndex, "\n")
     for i, t in ipairs(targets) do
         handle:write("target", i, ".name=", t.name, "\n")
-        handle:write("target", i, ".ip=", t.ip, "\n")
+        if t.type == "sd" then
+            handle:write("target", i, ".type=sd\n")
+            handle:write("target", i, ".path=", t.path or "", "\n")
+        else
+            handle:write("target", i, ".ip=", t.ip or "", "\n")
+        end
     end
     handle:close()
     return true
@@ -173,7 +197,8 @@ local function changeTarget(delta)
     end
     targetIndex = ((targetIndex - 1 + delta) % #targets) + 1
     saveConfig()
-    setStatus("TARGET: " .. targetName() .. "  " .. targetIp())
+    setStatus("TARGET: " .. targetName() .. "  " ..
+        (targetIsCard() and "(SD card)" or targetIp()))
 end
 
 -- ---------------------------------------------------------------- scanning
@@ -223,7 +248,7 @@ local function buildCmd(action, base, saveSlot)
     local cmd = PYTHON .. " " .. shq(appDir .. "/syncnds.py")
         .. " --name=" .. shq(name)
         .. " --tag=" .. shq(targetTag(name))
-        .. " " .. action .. " " .. shq(targetIp())
+        .. " " .. action .. " " .. shq(targetWhere())
     if base then cmd = cmd .. " " .. shq(base) end
     if saveSlot then cmd = cmd .. " " .. saveSlot end
     return cmd
@@ -322,7 +347,8 @@ local function openGame(game, keepSlot)
     current = game
     remote = nil
     local name = targetName()
-    startBackend("Checking the " .. name, "status", game.base, nil, function(res)
+    startBackend(targetIsCard() and ("Reading the " .. name .. " card")
+        or ("Checking the " .. name), "status", game.base, nil, function(res)
         remote = res
         slotSizes = {}
         for i = 0, SLOTS - 1 do
@@ -497,12 +523,23 @@ function love.keypressed(key)
     if key == "right" then moveGame(ROWS) return end
     if key == "l" then changeTarget(-1) return end
     if key == "r" then changeTarget(1) return end
-    if key == "i" then openIpEditor() return end
+    if key == "i" then
+        if targetIsCard() then
+            setStatus("THIS TARGET IS AN SD CARD - NO IP TO SET")
+        else
+            openIpEditor()
+        end
+        return
+    end
     if key == "t" then
         current = nil
         local name = targetName()
-        startBackend("Connecting to " .. targetIp() .. ":" .. PORT, "ping", nil, nil, function(res)
-            showResult(res.ok, name:upper() .. (res.ok and " CONNECTED" or " NOT REACHABLE"), res)
+        local label = targetIsCard() and "Looking for the card"
+            or ("Connecting to " .. targetIp() .. ":" .. PORT)
+        local found = targetIsCard() and " CARD FOUND" or " CONNECTED"
+        local missing = targetIsCard() and " CARD NOT FOUND" or " NOT REACHABLE"
+        startBackend(label, "ping", nil, nil, function(res)
+            showResult(res.ok, name:upper() .. (res.ok and found or missing), res)
         end)
         return
     end
@@ -566,7 +603,14 @@ end
 
 -- "3DS 192.168.1.10:5000  [1/2]" - the counter only when there is a choice.
 local function targetLine()
-    local line = targetName() .. " " .. targetIp() .. ":" .. PORT
+    local t = currentTarget()
+    local line
+    if t.type == "sd" then
+        line = t.name .. "   SD card " ..
+            ((t.path and t.path ~= "") and t.path or "(auto-detect)")
+    else
+        line = t.name .. " " .. (t.ip or "?") .. ":" .. PORT
+    end
     if #targets > 1 then
         line = line .. "   [" .. targetIndex .. "/" .. #targets .. "]"
     end
@@ -723,8 +767,9 @@ local function drawWorking()
     love.graphics.setFont(fontSmall)
     love.graphics.setColor(0.55, 0.60, 0.70)
     local secs = math.floor(job and job.elapsed or 0)
-    love.graphics.printf(secs .. "s elapsed    large saves can take several minutes over Wi-Fi",
-        20, 340, 600, "center")
+    local hint = targetIsCard() and "reading the card directly - no network involved"
+        or "large saves can take several minutes over Wi-Fi"
+    love.graphics.printf(secs .. "s elapsed    " .. hint, 20, 340, 600, "center")
 
     if job and job.elapsed >= CANCEL_AFTER then
         drawFooter("B CANCEL")

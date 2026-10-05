@@ -42,6 +42,27 @@ connections 1-3 are DS-mode only and cannot do WPA2.
 | X | edit this console's IP | - |
 | Y | test connection | - |
 
+## Two ways to reach the card
+
+Each target in `config.ini` is one of two types, and everything above the
+transport is shared - the same ROM lookup, save-size fitting, backup and
+read-back verification run either way.
+
+| Type | Reaches the console by |
+|---|---|
+| `ftp` | the network, with ftpd running on the console |
+| `sd` | the console's SD card inserted in this device |
+
+The `sd` type is much faster and needs no Wi-Fi at all. With `target3.path`
+left blank it finds the card itself, by looking for TWiLight's own
+`_nds/TWiLightMenu` folder across `/mnt/sdcard`, `/mnt/usb` and the other
+mount points. That marker is what makes detection safe: neither this device's
+muOS card nor its ROM card has it, so the wrong card cannot be picked. Set
+`target3.path` explicitly to skip the search.
+
+On a target of type `sd` the IP editor is disabled, and **Y** tests whether the
+card is present rather than pinging a console.
+
 ## Transfers and progress
 
 Throughput to a DSi is slow and depends heavily on how the handheld is
