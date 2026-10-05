@@ -284,6 +284,22 @@ def looks_like_card(root):
     return os.path.isdir(os.path.join(root, CARD_MARKER))
 
 
+def looks_stale(root):
+    """A mount that is backed by a device but reads as empty.
+
+    This is what a hot-swapped card looks like: muOS mounted the previous card
+    at boot, the new one went in underneath, and the kernel is still serving
+    the old filesystem's metadata. Writing through it could corrupt the card,
+    so it must never be mistaken for a usable target.
+    """
+    try:
+        if not os.path.ismount(root):
+            return False
+        return not os.listdir(root)
+    except OSError:
+        return True
+
+
 def candidate_mounts():
     seen, out = set(), []
     for path in list(CARD_HINTS) + sorted(glob.glob("/mnt/*")) \
@@ -305,6 +321,12 @@ def find_card(explicit=None):
     for path in tried:
         if looks_like_card(path):
             return path
+    stale = [path for path in tried if looks_stale(path)]
+    if stale:
+        raise SyncError(
+            "No TWiLight card visible, and %s looks stale (mounted but empty). "
+            "If the card went in after power-on, the old card's mount is still "
+            "there - reboot with the card inserted." % ", ".join(stale))
     raise SyncError("No TWiLight SD card found. Looked in: %s"
                     % (", ".join(tried) or "nothing mounted"))
 
