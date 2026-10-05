@@ -106,6 +106,9 @@ target2.name=DSi XL
 target2.ip=192.168.1.11
 ```
 
+The addresses above are placeholders - put your own consoles' IPs in, or set
+them on the device with X on the list screen.
+
 `target` is the console selected at startup. Add `target3.*` and so on for more.
 A bare `ip=...` left over from SaveSync3DS is read as target 1.
 
