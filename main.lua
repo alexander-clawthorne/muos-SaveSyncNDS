@@ -1,6 +1,6 @@
--- 3DS Save Sync for muOS
+-- NDS Save Sync for muOS
 -- Push or pull DraStic saves to/from a 3DS running ftpd (TWiLight Menu++ layout).
--- Transfers are done by sync3ds.py; this file is only the UI.
+-- Transfers are done by syncnds.py; this file is only the UI.
 
 local PORT = 5000
 local DEFAULT_IP = "192.168.1.120"
@@ -132,10 +132,10 @@ end
 
 -- Run the backend and parse its key=value output.
 local function runBackend(action, base, saveSlot)
-    local cmd = PYTHON .. " " .. shq(appDir .. "/sync3ds.py") .. " " .. action .. " " .. shq(ip)
+    local cmd = PYTHON .. " " .. shq(appDir .. "/syncnds.py") .. " " .. action .. " " .. shq(ip)
     if base then cmd = cmd .. " " .. shq(base) end
     if saveSlot then cmd = cmd .. " " .. saveSlot end
-    local out = { ok = false, msg = "No response from sync3ds.py", extra = {} }
+    local out = { ok = false, msg = "No response from syncnds.py", extra = {} }
     local pipe = io.popen(cmd .. " 2>&1")
     if not pipe then
         out.msg = "Could not start python3"
@@ -403,7 +403,7 @@ local function drawRow(y, selected)
 end
 
 local function drawList()
-    drawHeader("3DS SAVE SYNC", "3DS " .. ip .. ":" .. PORT .. "     " .. #games .. " DS games")
+    drawHeader("NDS SAVE SYNC", "3DS " .. ip .. ":" .. PORT .. "     " .. #games .. " DS games")
     love.graphics.setFont(fontSmall)
     for row = 1, ROWS do
         local index = gameScroll + row
@@ -528,7 +528,7 @@ local function drawConfirm()
 end
 
 local function drawWorking()
-    drawHeader("3DS SAVE SYNC", "3DS " .. ip .. ":" .. PORT)
+    drawHeader("NDS SAVE SYNC", "3DS " .. ip .. ":" .. PORT)
     love.graphics.setFont(fontBig)
     love.graphics.setColor(0.95, 0.96, 1.0)
     love.graphics.printf(job and job.label or "Working...", 20, 210, 600, "center")
@@ -536,7 +536,7 @@ local function drawWorking()
 end
 
 local function drawResult()
-    drawHeader("3DS SAVE SYNC", current and shorten(current.base, 90) or ("3DS " .. ip .. ":" .. PORT))
+    drawHeader("NDS SAVE SYNC", current and shorten(current.base, 90) or ("3DS " .. ip .. ":" .. PORT))
     if result.ok then
         love.graphics.setColor(0.18, 0.45, 0.25)
     else

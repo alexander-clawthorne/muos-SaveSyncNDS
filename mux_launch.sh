@@ -1,7 +1,7 @@
 #!/bin/bash
-# HELP: Push or pull DraStic saves to/from a 3DS running ftpd
-# ICON: savesync3ds
-# GRID: savesync3ds
+# HELP: Push or pull DraStic saves to/from a 3DS or DSi running ftpd
+# ICON: savesyncnds
+# GRID: savesyncnds
 
 . /opt/muos/script/var/func.sh
 
@@ -12,7 +12,7 @@ export HOME
 
 SETUP_SDL_ENVIRONMENT
 
-APP_DIR="$(GET_VAR "device" "storage/rom/mount")/MUOS/application/SaveSync3DS"
+APP_DIR="$(GET_VAR "device" "storage/rom/mount")/MUOS/application/SaveSyncNDS"
 controlfolder="$(GET_VAR "device" "storage/rom/mount")/MUOS/PortMaster"
 
 > "$APP_DIR/log.txt" && exec > >(tee "$APP_DIR/log.txt") 2>&1
@@ -24,7 +24,7 @@ SET_VAR "system" "foreground_process" "love.aarch64"
 
 cd "$APP_DIR" || exit 1
 
-"$controlfolder/gptokeyb2" -1 "love.aarch64" -c "$APP_DIR/savesync-3ds.gptk" &
+"$controlfolder/gptokeyb2" -1 "love.aarch64" -c "$APP_DIR/savesync-nds.gptk" &
 GPTOKEYB_PID=$!
 
 $LOVE_RUN "$APP_DIR"

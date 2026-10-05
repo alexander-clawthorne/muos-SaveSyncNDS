@@ -1,6 +1,6 @@
 function love.conf(t)
-    t.identity = "savesync-3ds"
-    t.window.title = "3DS Save Sync"
+    t.identity = "savesync-nds"
+    t.window.title = "NDS Save Sync"
     t.window.width = 640
     t.window.height = 480
     t.window.resizable = false

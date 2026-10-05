@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backend for 3DS Save Sync: move DraStic saves to/from a 3DS running ftpd.
+"""Backend for NDS Save Sync: move DraStic saves to/from a console running ftpd.
 
 The 3DS side follows TWiLight Menu++ / nds-bootstrap with SAVE_LOCATION = 0:
 the save lives in a "saves" folder next to the ROM, named after the ROM.
@@ -12,10 +12,10 @@ backup_use_sav_format = 0). Push reads whichever is newer. Pull always writes a
 raw .sav and moves any .dsv into the backup folder: with no .dsv present
 drastic-trngaje imports the .sav (seen with Custom Robo, 2026-09-29).
 
-    sync3ds.py ping   <ip>
-    sync3ds.py status <ip> <rom base name>
-    sync3ds.py push   <ip> <rom base name> [slot]     H -> 3DS
-    sync3ds.py pull   <ip> <rom base name> [slot]     3DS -> H
+    syncnds.py ping   <ip>
+    syncnds.py status <ip> <rom base name>
+    syncnds.py push   <ip> <rom base name> [slot]     H -> 3DS
+    syncnds.py pull   <ip> <rom base name> [slot]     3DS -> H
 
 Output is key=value lines for the LOVE front end. The last lines are always
 ok=1|0 and msg=<one line for the result screen>.
@@ -299,7 +299,7 @@ def cmd_pull(ip, base, slot):
     if backups:
         emit("backup", " + ".join(backups))
     os.makedirs(LOCAL_SAVE_DIR, exist_ok=True)
-    tmp = lpath + ".sync3ds.tmp"
+    tmp = lpath + ".syncnds.tmp"
     with open(tmp, "wb") as handle:
         handle.write(data)
         handle.flush()
@@ -317,7 +317,7 @@ def cmd_pull(ip, base, slot):
 
 def main(argv):
     if len(argv) < 3 or argv[1] not in ("ping", "status", "push", "pull"):
-        raise SyncError("usage: sync3ds.py ping|status|push|pull <ip> [rom base name] [slot]")
+        raise SyncError("usage: syncnds.py ping|status|push|pull <ip> [rom base name] [slot]")
     command, ip = argv[1], argv[2]
     if command == "ping":
         return cmd_ping(ip)
