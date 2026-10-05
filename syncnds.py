@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Backend for NDS Save Sync: move DraStic saves to/from a console running ftpd.
 
-The 3DS side follows TWiLight Menu++ / nds-bootstrap with SAVE_LOCATION = 0:
-the save lives in a "saves" folder next to the ROM, named after the ROM.
+A target is any console whose SD card follows the TWiLight Menu++ /
+nds-bootstrap layout with SAVE_LOCATION = 0: the save lives in a "saves"
+folder next to the ROM, named after the ROM. Confirmed on both a 3DS
+(letter folders, /roms/nds/<L>/) and a DSi XL (flat, /roms/nds/) - the ROM
+lookup handles either without configuration.
+
 TWiLight's per-game "save number" picks the file: slot 0 is <rom>.sav,
 slot N (1-9) is <rom>.savN. DraStic has one save per game.
 
@@ -12,18 +16,21 @@ backup_use_sav_format = 0). Push reads whichever is newer. Pull always writes a
 raw .sav and moves any .dsv into the backup folder: with no .dsv present
 drastic-trngaje imports the .sav (seen with Custom Robo, 2026-09-29).
 
---name is the console's display name for messages ("3DS", "DSi XL").
---tag is the short key used in backup filenames so each target's backups
-stay distinguishable; it defaults to "3ds" so backups written by the older
-SaveSync3DS keep their existing names.
-
     syncnds.py [--tag=T] [--name=N] ping   <ip>
-    syncnds.py status <ip> <rom base name>
-    syncnds.py push   <ip> <rom base name> [slot]     H -> 3DS
-    syncnds.py pull   <ip> <rom base name> [slot]     3DS -> H
+    syncnds.py [--tag=T] [--name=N] status <ip> <rom base name>
+    syncnds.py [--tag=T] [--name=N] push   <ip> <rom base name> [slot]
+    syncnds.py [--tag=T] [--name=N] pull   <ip> <rom base name> [slot]
 
-Output is key=value lines for the LOVE front end. The last lines are always
-ok=1|0 and msg=<one line for the result screen>.
+push sends this device's save to the target; pull brings the target's back.
+
+--name is the console's display name for messages ("3DS", "DSi XL").
+--tag is the short key used in backup filenames so each target's backups stay
+distinguishable. It defaults to "3ds", which keeps backups made by the older
+SaveSync3DS matching the names it already wrote.
+
+Output is key=value lines for the LOVE front end. "step=" lines report progress
+and are emitted while transfers run; the front end shows the most recent one.
+The last lines are always ok=1|0 and msg=<one line for the result screen>.
 """
 import ftplib
 import io
@@ -35,10 +42,17 @@ import time
 PORT = 5000
 USER = "a"
 PASSWORD = "a"
-TIMEOUT = 10
+# Transfers to a DSi are slow and highly variable: 85 KB/s measured from a
+# wired PC, but 7 KB/s from the handheld when it is associated with a Wi-Fi
+# extender on another band. The old 10s timeout was tighter than the work it
+# was meant to allow. This is per socket operation, not per transfer.
+TIMEOUT = 60
 SLOTS = 10
+PROGRESS_EVERY = 0.4        # seconds between step= lines during a transfer
 
 LOCAL_SAVE_DIR = "/mnt/mmc/MUOS/save/drastic/backup"
+# Deliberately still sync3ds_backups: this directory already holds the existing
+# backup history, and the pruning below only sees what it can list.
 BACKUP_DIR = LOCAL_SAVE_DIR + "/sync3ds_backups"
 BACKUPS_KEPT = 10
 REMOTE_ROM_ROOT = "/roms/nds"
@@ -55,6 +69,13 @@ class SyncError(Exception):
 
 def emit(key, value):
     print("%s=%s" % (key, str(value).replace("\n", " ")), flush=True)
+
+
+def step(text):
+    emit("step", text)
+    # -2 means "no transfer in flight", so the front end hides the bar between
+    # phases instead of leaving it stuck at the previous percentage.
+    emit("pct", -2)
 
 
 def connect(ip):
@@ -122,13 +143,48 @@ def slot_name(base, slot):
     return base + ".sav" + ("" if slot == 0 else str(slot))
 
 
-def remote_read(ftp, path):
+def progress_reporter(label, total):
+    """Callback emitting step= and pct= as bytes move, at most every 0.4s.
+
+    pct is -1 when the total is unknown, which tells the front end to show an
+    indeterminate bar rather than a wrong one.
+    """
+    seen = [0]
+    last = [0.0]
+
+    def report(chunk):
+        seen[0] += len(chunk)
+        now = time.time()
+        if now - last[0] >= PROGRESS_EVERY:
+            last[0] = now
+            if total:
+                done = min(100, 100 * seen[0] // total)
+                step("%s %s / %s" % (label, kb(seen[0]), kb(total)))
+                emit("pct", done)
+            else:
+                step("%s %s" % (label, kb(seen[0])))
+                emit("pct", -1)
+    return report
+
+
+def remote_read(ftp, path, label=None, total=None):
     buf = io.BytesIO()
+    report = progress_reporter(label, total) if label else None
+
+    def sink(chunk):
+        buf.write(chunk)
+        if report:
+            report(chunk)
     try:
-        ftp.retrbinary("RETR " + path, buf.write)
+        ftp.retrbinary("RETR " + path, sink)
     except MISSING:
         return None
     return buf.getvalue()
+
+
+def remote_write(ftp, path, data, label=None):
+    report = progress_reporter(label, len(data)) if label else None
+    ftp.storbinary("STOR " + path, io.BytesIO(data), callback=report)
 
 
 def remote_size(ftp, path):
@@ -239,6 +295,7 @@ def slot_label(slot):
 
 
 def cmd_ping(ip):
+    step("Connecting to " + TARGET_NAME)
     ftp = connect(ip)
     close(ftp)
     return "Connected to %s at %s:%d" % (TARGET_NAME, ip, PORT)
@@ -248,11 +305,15 @@ def cmd_status(ip, base):
     local, fmt, _ = local_save(base)
     emit("local_size", -1 if local is None else len(local))
     emit("local_format", fmt or "none")
+    step("Connecting to " + TARGET_NAME)
     ftp = connect(ip)
     try:
+        step("Looking for the ROM")
         rdir = remote_save_dir(ftp, base)
         emit("remote_dir", rdir)
+        step("Reading TWiLight settings")
         emit("twilight_slot", twilight_slot(ftp, base))
+        step("Checking save slots")
         sizes = slot_sizes(ftp, rdir, base)
         for slot, size in sorted(sizes.items()):
             emit("slot_%d" % slot, size)
@@ -265,12 +326,17 @@ def cmd_push(ip, base, slot):
     local, _, _ = local_save(base)
     if local is None:
         raise SyncError("No DraStic save on this device for that game")
+    step("Connecting to " + TARGET_NAME)
     ftp = connect(ip)
     try:
+        step("Looking for the ROM")
         rdir = remote_save_dir(ftp, base)
         rpath = rdir + "/" + slot_name(base, slot)
-        old = remote_read(ftp, rpath)
+        existing = remote_size(ftp, rpath)
+        old = remote_read(ftp, rpath, "Reading the current save",
+                          existing if existing > 0 else None)
         if old is not None:
+            step("Backing up the old save")
             emit("backup", backup(base, "%s%d" % (TARGET_TAG, slot), old))
             data = fit(local, len(old), old[-1] if old else 0xFF)
         else:
@@ -281,12 +347,23 @@ def cmd_push(ip, base, slot):
                 ftp.mkd(rdir)
             except MISSING:
                 pass  # already exists
-        ftp.storbinary("STOR " + rpath, io.BytesIO(data))
-        if remote_read(ftp, rpath) != data:
-            raise SyncError("Upload did not verify - %s copy differs. Backup kept."
-                            % TARGET_NAME)
+        remote_write(ftp, rpath, data, "Uploading")
     finally:
         close(ftp)
+
+    # Verify on a fresh connection. A DSi serving three data transfers back to
+    # back in one session wedged with the control socket still open; a new
+    # session for the read-back avoids it and costs only a reconnect.
+    step("Verifying")
+    ftp = connect(ip)
+    try:
+        written = remote_read(ftp, rpath, "Verifying", len(data))
+    finally:
+        close(ftp)
+    if written != data:
+        raise SyncError("Upload did not verify - %s copy differs. Backup kept."
+                        % TARGET_NAME)
+
     note = ""
     if len(data) > len(local):
         note = " (padded from %s to the size nds-bootstrap uses)" % kb(len(local))
@@ -296,10 +373,15 @@ def cmd_push(ip, base, slot):
 
 def cmd_pull(ip, base, slot):
     lpath, dsv_path = local_paths(base)
+    step("Connecting to " + TARGET_NAME)
     ftp = connect(ip)
     try:
+        step("Looking for the ROM")
         rdir = remote_save_dir(ftp, base)
-        remote = remote_read(ftp, rdir + "/" + slot_name(base, slot))
+        rpath = rdir + "/" + slot_name(base, slot)
+        existing = remote_size(ftp, rpath)
+        remote = remote_read(ftp, rpath, "Downloading",
+                             existing if existing > 0 else None)
     finally:
         close(ftp)
     if remote is None:
@@ -308,6 +390,7 @@ def cmd_pull(ip, base, slot):
     data = remote if old is None else fit(remote, len(old), 0xFF)
     # Back up both formats before touching either; the .dsv is moved away so
     # DraStic picks up the new .sav instead of its own older copy.
+    step("Backing up this device's save")
     backups = []
     if os.path.exists(lpath):
         backups.append(backup(base, "h", local_read(lpath)))
@@ -315,6 +398,7 @@ def cmd_pull(ip, base, slot):
         backups.append(backup(base, "h", local_read(dsv_path), "dsv"))
     if backups:
         emit("backup", " + ".join(backups))
+    step("Writing the save")
     os.makedirs(LOCAL_SAVE_DIR, exist_ok=True)
     tmp = lpath + ".syncnds.tmp"
     with open(tmp, "wb") as handle:
@@ -322,6 +406,7 @@ def cmd_pull(ip, base, slot):
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp, lpath)
+    step("Verifying")
     if local_read(lpath) != data:
         raise SyncError("Write did not verify - local copy differs. Backup kept.")
     if os.path.exists(dsv_path):
