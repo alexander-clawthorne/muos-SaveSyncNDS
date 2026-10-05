@@ -1,9 +1,16 @@
 -- NDS Save Sync for muOS
--- Push or pull DraStic saves to/from a 3DS running ftpd (TWiLight Menu++ layout).
--- Transfers are done by syncnds.py; this file is only the UI.
+-- Push or pull DraStic saves to/from any console running ftpd with the
+-- TWiLight Menu++ layout (3DS, DSi XL, ...). Transfers are done by
+-- syncnds.py; this file is only the UI.
+--
+-- The backend runs detached, writing key=value lines to JOB_OUT, which this
+-- file polls each frame. Throughput to a DSi varies enormously with where the
+-- handheld is associated: measured 85 KB/s from a wired PC but only 7 KB/s
+-- from this device via a Wi-Fi extender, which turns a push into minutes.
+-- Blocking on io.popen for that long made the app look frozen, so it is
+-- launched detached and polled instead.
 
 local PORT = 5000
-local DEFAULT_IP = "192.168.1.120"
 local LOCAL_SAVE_DIR = "/mnt/mmc/MUOS/save/drastic/backup"
 local ROM_DIRS = {
     "/mnt/sdcard/ROMS/DS",
@@ -12,14 +19,25 @@ local ROM_DIRS = {
     "/mnt/mmc/ROMS/NDS",
 }
 local PYTHON = "/usr/bin/python3"
+local JOB_OUT = "/tmp/savesyncnds.out"
 local ROWS = 11
 local SLOTS = 10            -- TWiLight save numbers: 0 = .sav, N = .savN
+local POLL_EVERY = 0.2      -- seconds between reads of JOB_OUT
+local CANCEL_AFTER = 3      -- seconds before B will abort a running job
+
+-- Used only when config.ini is missing or unreadable.
+local DEFAULT_TARGETS = {
+    { name = "3DS", ip = "192.168.1.10" },
+    { name = "DSi XL", ip = "192.168.1.11" },
+}
 
 local appDir = love.filesystem.getSource()
 local configPath = appDir .. "/config.ini"
 
 local state = "list"        -- "list" | "ip" | "game" | "confirm" | "working" | "result"
-local ip = DEFAULT_IP
+
+local targets = {}          -- { { name = "...", ip = "..." } }
+local targetIndex = 1
 
 local games = {}            -- { base = "...", hasLocal = bool }
 local gameIndex = 1
@@ -33,11 +51,11 @@ local remote = nil          -- result of "status" for the selected game
 local options = {}
 local optionIndex = 1
 local pendingAction = nil   -- "push" | "pull"
-local slot = 0              -- 3DS save slot to push to / pull from
-local slotSizes = {}        -- [slot] = bytes, for slots that exist on the 3DS
+local slot = 0              -- target save slot to push to / pull from
+local slotSizes = {}        -- [slot] = bytes, for slots that exist on the target
 local twilightSlot = 0      -- slot TWiLight is currently set to for this game
 
-local job = nil             -- { label, run, frames }
+local job = nil             -- { label, started, elapsed, nextPoll, step, pct, onDone }
 local result = nil          -- { ok, title, msg, backup, extra }
 
 local status = ""
@@ -55,10 +73,6 @@ local function trim(value)
     return (value:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
-local function basename(path)
-    return path:match("([^/]+)$") or path
-end
-
 local function shq(value)
     return "'" .. value:gsub("'", "'\\''") .. "'"
 end
@@ -74,23 +88,95 @@ local function kb(bytes)
     return bytes .. " B"
 end
 
+-- ---------------------------------------------------------------- targets
+
+local function currentTarget()
+    return targets[targetIndex] or DEFAULT_TARGETS[1]
+end
+
+local function targetName()
+    return currentTarget().name
+end
+
+local function targetIp()
+    return currentTarget().ip
+end
+
+-- Short key used in backup filenames. "3DS" -> "3ds", "DSi XL" -> "dsixl".
+local function targetTag(name)
+    return (name:lower():gsub("[^%w]", ""))
+end
+
+-- config.ini is strict key=value (muOS ini rules: never space the "=").
+--
+--   target=2
+--   target1.name=3DS
+--   target1.ip=192.168.1.10
+--   target2.name=DSi XL
+--   target2.ip=192.168.1.11
+--
+-- A bare "ip=..." from the old SaveSync3DS config is read as target 1.
 local function loadConfig()
     local handle = io.open(configPath, "r")
-    if not handle then return end
+    if not handle then
+        for i, t in ipairs(DEFAULT_TARGETS) do targets[i] = { name = t.name, ip = t.ip } end
+        return
+    end
+    local byIndex, selected, legacyIp, highest = {}, nil, nil, 0
     for line in handle:lines() do
-        local value = line:match("^ip=(.+)$")
-        if value then ip = trim(value) end
+        local n, key, value = line:match("^target(%d+)%.(%w+)=(.*)$")
+        if n then
+            n = tonumber(n)
+            byIndex[n] = byIndex[n] or {}
+            byIndex[n][key] = trim(value)
+            if n > highest then highest = n end
+        else
+            local sel = line:match("^target=(%d+)$")
+            if sel then selected = tonumber(sel) end
+            local old = line:match("^ip=(.+)$")
+            if old then legacyIp = trim(old) end
+        end
     end
     handle:close()
+
+    for i = 1, highest do
+        local entry = byIndex[i]
+        if entry and entry.ip and entry.ip ~= "" then
+            targets[#targets + 1] = { name = entry.name or ("Target " .. i), ip = entry.ip }
+        end
+    end
+    if #targets == 0 and legacyIp then
+        targets[1] = { name = "3DS", ip = legacyIp }
+    end
+    if #targets == 0 then
+        for i, t in ipairs(DEFAULT_TARGETS) do targets[i] = { name = t.name, ip = t.ip } end
+    end
+    if selected and targets[selected] then targetIndex = selected end
 end
 
 local function saveConfig()
     local handle = io.open(configPath, "w")
     if not handle then return false end
-    handle:write("ip=", ip, "\n")
+    handle:write("target=", targetIndex, "\n")
+    for i, t in ipairs(targets) do
+        handle:write("target", i, ".name=", t.name, "\n")
+        handle:write("target", i, ".ip=", t.ip, "\n")
+    end
     handle:close()
     return true
 end
+
+local function changeTarget(delta)
+    if #targets < 2 then
+        setStatus("ONLY ONE TARGET IN CONFIG.INI")
+        return
+    end
+    targetIndex = ((targetIndex - 1 + delta) % #targets) + 1
+    saveConfig()
+    setStatus("TARGET: " .. targetName() .. "  " .. targetIp())
+end
+
+-- ---------------------------------------------------------------- scanning
 
 local function listFiles(dir, ext)
     local found = {}
@@ -130,35 +216,67 @@ local function listGames()
     return list
 end
 
--- Run the backend and parse its key=value output.
-local function runBackend(action, base, saveSlot)
-    local cmd = PYTHON .. " " .. shq(appDir .. "/syncnds.py") .. " " .. action .. " " .. shq(ip)
+-- ---------------------------------------------------------------- backend
+
+local function buildCmd(action, base, saveSlot)
+    local name = targetName()
+    local cmd = PYTHON .. " " .. shq(appDir .. "/syncnds.py")
+        .. " --name=" .. shq(name)
+        .. " --tag=" .. shq(targetTag(name))
+        .. " " .. action .. " " .. shq(targetIp())
     if base then cmd = cmd .. " " .. shq(base) end
     if saveSlot then cmd = cmd .. " " .. saveSlot end
-    local out = { ok = false, msg = "No response from syncnds.py", extra = {} }
-    local pipe = io.popen(cmd .. " 2>&1")
-    if not pipe then
-        out.msg = "Could not start python3"
-        return out
-    end
-    for line in pipe:lines() do
+    return cmd
+end
+
+-- Parse everything written so far. Partial last lines simply fail to match.
+local function readJob()
+    local out = { ok = false, extra = {}, done = false, pct = -2, sawOk = false }
+    local handle = io.open(JOB_OUT, "r")
+    if not handle then return out end
+    for line in handle:lines() do
         local key, value = line:match("^([%w_]+)=(.*)$")
-        if key == "ok" then
+        if key == "done" then
+            out.done = true
+        elseif key == "ok" then
             out.ok = value == "1"
+            out.sawOk = true
+        elseif key == "pct" then
+            out.pct = tonumber(value) or -2
         elseif key then
             out[key] = value
         elseif trim(line) ~= "" then
             out.extra[#out.extra + 1] = line
         end
     end
-    pipe:close()
+    handle:close()
     return out
 end
 
--- Show a "working" frame, then run fn on the next update.
-local function startJob(label, fn)
-    job = { label = label, run = fn, frames = 0 }
+-- Launch detached so love keeps drawing. The subshell appends done=<status>
+-- after python exits, so a crash still ends the job instead of hanging.
+local function startBackend(label, action, base, saveSlot, onDone)
+    os.remove(JOB_OUT)
+    os.execute("( " .. buildCmd(action, base, saveSlot) .. " ; echo done=$? ) > "
+        .. JOB_OUT .. " 2>&1 &")
+    job = {
+        label = label,
+        started = love.timer.getTime(),
+        elapsed = 0,
+        nextPoll = 0,
+        step = "Starting...",
+        pct = -2,
+        cancelled = false,
+        onDone = onDone,
+    }
     state = "working"
+end
+
+local function cancelJob()
+    if not job or job.cancelled then return end
+    job.cancelled = true
+    job.step = "Cancelling..."
+    os.execute("pkill -f syncnds.py >/dev/null 2>&1")
 end
 
 local function showResult(ok, title, res)
@@ -193,7 +311,7 @@ end
 -- ---------------------------------------------------------------- screens
 
 local function openIpEditor()
-    local a, b, c, d = ip:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+    local a, b, c, d = targetIp():match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
     octets = { tonumber(a) or 192, tonumber(b) or 168, tonumber(c) or 1, tonumber(d) or 129 }
     octetIndex = 4
     state = "ip"
@@ -203,19 +321,20 @@ end
 local function openGame(game, keepSlot)
     current = game
     remote = nil
-    startJob("Checking the 3DS...", function()
-        remote = runBackend("status", game.base)
+    local name = targetName()
+    startBackend("Checking the " .. name, "status", game.base, nil, function(res)
+        remote = res
         slotSizes = {}
         for i = 0, SLOTS - 1 do
-            local size = tonumber(remote["slot_" .. i] or "")
+            local size = tonumber(res["slot_" .. i] or "")
             if size then slotSizes[i] = size end
         end
-        twilightSlot = tonumber(remote.twilight_slot or "0") or 0
+        twilightSlot = tonumber(res.twilight_slot or "0") or 0
         if not keepSlot then slot = twilightSlot end
         options = {
             { id = "slot" },
-            { id = "push", label = "PUSH   this device  ->  3DS" },
-            { id = "pull", label = "PULL   3DS  ->  this device" },
+            { id = "push", label = "PUSH   this device  ->  " .. name:upper() },
+            { id = "pull", label = "PULL   " .. name:upper() .. "  ->  this device" },
             { id = "back", label = "BACK" },
         }
         if not keepSlot then optionIndex = 2 end
@@ -227,7 +346,7 @@ local function slotFile(n)
     return n == 0 and ".sav" or (".sav" .. n)
 end
 
--- Size of the selected slot on the 3DS: bytes, -1 if empty, nil if unknown.
+-- Size of the selected slot on the target: bytes, -1 if empty, nil if unknown.
 local function remoteSize()
     if not (remote and remote.ok) then return nil end
     return slotSizes[slot] or -1
@@ -253,7 +372,7 @@ local function chooseOption()
         return
     end
     if option.id == "pull" and remoteSize() == -1 then
-        setStatus("3DS SLOT " .. slot .. " (" .. slotFile(slot) .. ") IS EMPTY")
+        setStatus(targetName():upper() .. " SLOT " .. slot .. " (" .. slotFile(slot) .. ") IS EMPTY")
         return
     end
     pendingAction = option.id
@@ -262,10 +381,10 @@ end
 
 local function runPending()
     local action = pendingAction
-    local label = action == "push" and ("Sending save to 3DS slot " .. slot .. "...")
-        or ("Copying 3DS slot " .. slot .. " to this device...")
-    startJob(label, function()
-        local res = runBackend(action, current.base, slot)
+    local name = targetName()
+    local label = action == "push" and ("Sending save to " .. name .. " slot " .. slot)
+        or ("Copying " .. name .. " slot " .. slot .. " to this device")
+    startBackend(label, action, current.base, slot, function(res)
         local title = (action == "push" and "PUSH" or "PULL") .. (res.ok and " COMPLETE" or " FAILED")
         if res.ok and action == "pull" then current.hasLocal = true end
         showResult(res.ok, title, res)
@@ -287,18 +406,33 @@ function love.load()
 end
 
 function love.update()
-    if job then
-        job.frames = job.frames + 1
-        if job.frames >= 2 then      -- make sure the working frame was drawn
-            local run = job.run
-            job = nil
-            run()
-        end
+    if not job then return end
+    local now = love.timer.getTime()
+    job.elapsed = now - job.started
+    if now < job.nextPoll then return end
+    job.nextPoll = now + POLL_EVERY
+
+    local res = readJob()
+    if res.step then job.step = res.step end
+    job.pct = res.pct
+    if not res.done then return end
+
+    local onDone = job.onDone
+    local cancelled = job.cancelled
+    job = nil
+    if not res.sawOk then
+        res.ok = false
+        res.msg = cancelled and "Cancelled. Any backup taken before this is kept."
+            or "The backend stopped without a result - see the lines below."
     end
+    onDone(res)
 end
 
 function love.keypressed(key)
-    if state == "working" then return end
+    if state == "working" then
+        if key == "escape" and job and job.elapsed >= CANCEL_AFTER then cancelJob() end
+        return
+    end
 
     if state == "result" then
         if key == "return" or key == "escape" then
@@ -317,8 +451,12 @@ function love.keypressed(key)
         elseif key == "left" then octetIndex = math.max(1, octetIndex - 1)
         elseif key == "right" then octetIndex = math.min(4, octetIndex + 1)
         elseif key == "return" then
-            ip = table.concat(octets, ".")
-            if saveConfig() then setStatus("3DS IP SET TO " .. ip) else setStatus("IP SET (COULD NOT SAVE CONFIG)") end
+            currentTarget().ip = table.concat(octets, ".")
+            if saveConfig() then
+                setStatus(targetName():upper() .. " IP SET TO " .. targetIp())
+            else
+                setStatus("IP SET (COULD NOT SAVE CONFIG)")
+            end
             state = "list"
         elseif key == "escape" then
             state = "list"
@@ -357,12 +495,14 @@ function love.keypressed(key)
     if key == "down" then moveGame(1) return end
     if key == "left" then moveGame(-ROWS) return end
     if key == "right" then moveGame(ROWS) return end
+    if key == "l" then changeTarget(-1) return end
+    if key == "r" then changeTarget(1) return end
     if key == "i" then openIpEditor() return end
     if key == "t" then
         current = nil
-        startJob("Connecting to " .. ip .. ":" .. PORT .. "...", function()
-            local res = runBackend("ping")
-            showResult(res.ok, res.ok and "3DS CONNECTED" or "3DS NOT REACHABLE", res)
+        local name = targetName()
+        startBackend("Connecting to " .. targetIp() .. ":" .. PORT, "ping", nil, nil, function(res)
+            showResult(res.ok, name:upper() .. (res.ok and " CONNECTED" or " NOT REACHABLE"), res)
         end)
         return
     end
@@ -370,6 +510,8 @@ function love.keypressed(key)
         openGame(games[gameIndex])
     end
 end
+
+-- ---------------------------------------------------------------- drawing
 
 local function drawHeader(title, subtitle)
     love.graphics.setColor(0.13, 0.15, 0.20)
@@ -402,8 +544,37 @@ local function drawRow(y, selected)
     end
 end
 
+-- pct >= 0 fills proportionally; pct < 0 slides a block to show it is alive.
+local function drawBar(x, y, w, h, pct)
+    love.graphics.setColor(0.17, 0.19, 0.25)
+    love.graphics.rectangle("fill", x, y, w, h, 5, 5)
+    love.graphics.setColor(0.30, 0.65, 0.95)
+    if pct >= 0 then
+        local filled = w * math.min(pct, 100) / 100
+        if filled > 2 then
+            love.graphics.rectangle("fill", x, y, filled, h, 5, 5)
+        end
+    else
+        local chunk = w * 0.22
+        local t = (love.timer.getTime() * 0.55) % 2
+        if t > 1 then t = 2 - t end
+        love.graphics.rectangle("fill", x + (w - chunk) * t, y, chunk, h, 5, 5)
+    end
+    love.graphics.setColor(0.40, 0.44, 0.52)
+    love.graphics.rectangle("line", x, y, w, h, 5, 5)
+end
+
+-- "3DS 192.168.1.10:5000  [1/2]" - the counter only when there is a choice.
+local function targetLine()
+    local line = targetName() .. " " .. targetIp() .. ":" .. PORT
+    if #targets > 1 then
+        line = line .. "   [" .. targetIndex .. "/" .. #targets .. "]"
+    end
+    return line
+end
+
 local function drawList()
-    drawHeader("NDS SAVE SYNC", "3DS " .. ip .. ":" .. PORT .. "     " .. #games .. " DS games")
+    drawHeader("NDS SAVE SYNC", targetLine() .. "     " .. #games .. " DS games")
     love.graphics.setFont(fontSmall)
     for row = 1, ROWS do
         local index = gameScroll + row
@@ -422,11 +593,11 @@ local function drawList()
         end
         love.graphics.print(shorten(game.base, 82), 72, y + 4)
     end
-    drawFooter("A SELECT   X EDIT 3DS IP   Y TEST 3DS   B EXIT")
+    drawFooter("A SELECT   L1/R1 CONSOLE   X EDIT IP   Y TEST   B EXIT")
 end
 
 local function drawIp()
-    drawHeader("3DS IP ADDRESS", "Port " .. PORT .. " is fixed")
+    drawHeader(targetName():upper() .. " IP ADDRESS", "Port " .. PORT .. " is fixed")
     love.graphics.setFont(fontBig)
     local x = 110
     for i = 1, 4 do
@@ -449,11 +620,12 @@ local function drawIp()
 end
 
 local function drawGame()
-    drawHeader(shorten(current.base, 70), "Choose what to do with this save")
+    local name = targetName()
+    drawHeader(shorten(current.base, 70), "Choose what to do with this save   (" .. name .. ")")
     love.graphics.setFont(font)
     love.graphics.setColor(0.72, 0.76, 0.84)
     love.graphics.print("This device:", 18, 72)
-    love.graphics.print("3DS slots:", 18, 100)
+    love.graphics.print(shorten(name, 12) .. " slots:", 18, 100)
     love.graphics.setColor(0.95, 0.96, 1.0)
     local localText = "no save"
     if current.hasLocal then
@@ -485,7 +657,7 @@ local function drawGame()
         if option.id == "slot" then
             local size = remoteSize()
             local info = size == nil and "" or (size >= 0 and kb(size) or "empty")
-            label = "3DS SAVE SLOT   < " .. slot .. " >   " .. slotFile(slot) .. "   " .. info
+            label = "SAVE SLOT   < " .. slot .. " >   " .. slotFile(slot) .. "   " .. info
         end
         love.graphics.print(label, 24, y)
     end
@@ -494,6 +666,7 @@ end
 
 local function drawConfirm()
     local push = pendingAction == "push"
+    local name = targetName()
     drawHeader(push and "CONFIRM PUSH" or "CONFIRM PULL", shorten(current.base, 90))
     love.graphics.setFont(font)
     love.graphics.setColor(0.95, 0.96, 1.0)
@@ -501,10 +674,10 @@ local function drawConfirm()
     if push then
         local size = remoteSize()
         lines = {
-            "Send this device's save to 3DS slot " .. slot .. " (" .. slotFile(slot) .. ")?",
+            "Send this device's save to " .. name .. " slot " .. slot .. " (" .. slotFile(slot) .. ")?",
             "",
-            size == -1 and "That slot is empty on the 3DS - a new save file is created."
-                or "The 3DS save in that slot will be REPLACED.",
+            size == -1 and ("That slot is empty on the " .. name .. " - a new save file is created.")
+                or ("The " .. name .. " save in that slot will be REPLACED."),
             size == -1 and "" or "Its current copy is backed up on this device first.",
         }
         if slot ~= twilightSlot then
@@ -512,7 +685,7 @@ local function drawConfirm()
         end
     else
         lines = {
-            "Copy 3DS slot " .. slot .. " (" .. slotFile(slot) .. ") to this device?",
+            "Copy " .. name .. " slot " .. slot .. " (" .. slotFile(slot) .. ") to this device?",
             "",
             current.hasLocal and "This device's DraStic save will be REPLACED."
                 or "This device has no save for this game yet.",
@@ -528,15 +701,40 @@ local function drawConfirm()
 end
 
 local function drawWorking()
-    drawHeader("NDS SAVE SYNC", "3DS " .. ip .. ":" .. PORT)
+    drawHeader("NDS SAVE SYNC", targetLine())
     love.graphics.setFont(fontBig)
     love.graphics.setColor(0.95, 0.96, 1.0)
-    love.graphics.printf(job and job.label or "Working...", 20, 210, 600, "center")
-    drawFooter("PLEASE WAIT")
+    love.graphics.printf(job and job.label or "Working", 20, 120, 600, "center")
+
+    local pct = job and job.pct or -2
+    if pct ~= -2 then
+        drawBar(70, 220, 500, 26, pct)
+        if pct >= 0 then
+            love.graphics.setFont(font)
+            love.graphics.setColor(0.95, 0.96, 1.0)
+            love.graphics.printf(pct .. "%", 70, 254, 500, "center")
+        end
+    end
+
+    love.graphics.setFont(font)
+    love.graphics.setColor(0.72, 0.76, 0.84)
+    love.graphics.printf(job and job.step or "", 20, 300, 600, "center")
+
+    love.graphics.setFont(fontSmall)
+    love.graphics.setColor(0.55, 0.60, 0.70)
+    local secs = math.floor(job and job.elapsed or 0)
+    love.graphics.printf(secs .. "s elapsed    large saves can take several minutes over Wi-Fi",
+        20, 340, 600, "center")
+
+    if job and job.elapsed >= CANCEL_AFTER then
+        drawFooter("B CANCEL")
+    else
+        drawFooter("PLEASE WAIT")
+    end
 end
 
 local function drawResult()
-    drawHeader("NDS SAVE SYNC", current and shorten(current.base, 90) or ("3DS " .. ip .. ":" .. PORT))
+    drawHeader("NDS SAVE SYNC", current and shorten(current.base, 90) or targetLine())
     if result.ok then
         love.graphics.setColor(0.18, 0.45, 0.25)
     else
