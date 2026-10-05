@@ -1,0 +1,5 @@
+# This repo is deployed to Linux handhelds. A CRLF mux_launch.sh fails there
+# with "env: 'bash\r': No such file or directory", so force LF on checkout
+# regardless of the cloning machine's core.autocrlf.
+* text=auto eol=lf
+*.png -text
