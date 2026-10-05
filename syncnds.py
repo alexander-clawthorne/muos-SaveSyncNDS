@@ -12,7 +12,12 @@ backup_use_sav_format = 0). Push reads whichever is newer. Pull always writes a
 raw .sav and moves any .dsv into the backup folder: with no .dsv present
 drastic-trngaje imports the .sav (seen with Custom Robo, 2026-09-29).
 
-    syncnds.py ping   <ip>
+--name is the console's display name for messages ("3DS", "DSi XL").
+--tag is the short key used in backup filenames so each target's backups
+stay distinguishable; it defaults to "3ds" so backups written by the older
+SaveSync3DS keep their existing names.
+
+    syncnds.py [--tag=T] [--name=N] ping   <ip>
     syncnds.py status <ip> <rom base name>
     syncnds.py push   <ip> <rom base name> [slot]     H -> 3DS
     syncnds.py pull   <ip> <rom base name> [slot]     3DS -> H
@@ -39,6 +44,10 @@ BACKUPS_KEPT = 10
 REMOTE_ROM_ROOT = "/roms/nds"
 GAMESETTINGS_DIR = "/_nds/TWiLightMenu/gamesettings"
 
+# Replaced by --name / --tag; the defaults keep older command lines working.
+TARGET_NAME = "3DS"
+TARGET_TAG = "3ds"
+
 
 class SyncError(Exception):
     pass
@@ -54,7 +63,8 @@ def connect(ip):
         ftp.connect(ip, PORT, timeout=TIMEOUT)
         ftp.login(USER, PASSWORD)
     except (OSError, ftplib.Error) as exc:
-        raise SyncError("Cannot reach 3DS at %s:%d - is ftpd open? (%s)" % (ip, PORT, exc))
+        raise SyncError("Cannot reach %s at %s:%d - is ftpd open? (%s)"
+                        % (TARGET_NAME, ip, PORT, exc))
     return ftp
 
 
@@ -65,7 +75,7 @@ def close(ftp):
         pass
 
 
-# ftpd on the 3DS reports a missing file as "450 No such file or directory"
+# ftpd reports a missing file as "450 No such file or directory"
 # (a temporary error), where most servers use 550.
 MISSING = (ftplib.error_perm, ftplib.error_temp)
 
@@ -81,7 +91,11 @@ def list_names(ftp, path):
 
 
 def find_remote_rom_dir(ftp, base):
-    """Directory on the 3DS holding <base>.nds, or None."""
+    """Directory on the target holding <base>.nds, or None.
+
+    Handles both layouts seen so far: ROMs directly under /roms/nds (the
+    DSi XL) and ROMs in letter folders /roms/nds/<L>/ (the 3DS).
+    """
     rom = base + ".nds"
     first = base[:1].upper()
     top = list_names(ftp, REMOTE_ROM_ROOT)
@@ -99,7 +113,8 @@ def find_remote_rom_dir(ftp, base):
 def remote_save_dir(ftp, base):
     rom_dir = find_remote_rom_dir(ftp, base)
     if rom_dir is None:
-        raise SyncError("ROM not found on 3DS under %s: %s.nds" % (REMOTE_ROM_ROOT, base))
+        raise SyncError("ROM not found on %s under %s: %s.nds"
+                        % (TARGET_NAME, REMOTE_ROM_ROOT, base))
     return rom_dir + "/saves"
 
 
@@ -125,7 +140,7 @@ def remote_size(ftp, path):
 
 
 def slot_sizes(ftp, rdir, base):
-    """{slot: size} for every save slot file that exists on the 3DS."""
+    """{slot: size} for every save slot file that exists on the target."""
     names = set(list_names(ftp, rdir))
     ftp.voidcmd("TYPE I")
     return {slot: remote_size(ftp, rdir + "/" + slot_name(base, slot))
@@ -226,7 +241,7 @@ def slot_label(slot):
 def cmd_ping(ip):
     ftp = connect(ip)
     close(ftp)
-    return "Connected to 3DS at %s:%d" % (ip, PORT)
+    return "Connected to %s at %s:%d" % (TARGET_NAME, ip, PORT)
 
 
 def cmd_status(ip, base):
@@ -243,7 +258,7 @@ def cmd_status(ip, base):
             emit("slot_%d" % slot, size)
     finally:
         close(ftp)
-    return "%d save slot(s) on the 3DS" % len(sizes)
+    return "%d save slot(s) on the %s" % (len(sizes), TARGET_NAME)
 
 
 def cmd_push(ip, base, slot):
@@ -256,7 +271,7 @@ def cmd_push(ip, base, slot):
         rpath = rdir + "/" + slot_name(base, slot)
         old = remote_read(ftp, rpath)
         if old is not None:
-            emit("backup", backup(base, "3ds%d" % slot, old))
+            emit("backup", backup(base, "%s%d" % (TARGET_TAG, slot), old))
             data = fit(local, len(old), old[-1] if old else 0xFF)
         else:
             # New slot: match the size nds-bootstrap uses for this game's other slots.
@@ -268,13 +283,15 @@ def cmd_push(ip, base, slot):
                 pass  # already exists
         ftp.storbinary("STOR " + rpath, io.BytesIO(data))
         if remote_read(ftp, rpath) != data:
-            raise SyncError("Upload did not verify - 3DS copy differs. Backup kept.")
+            raise SyncError("Upload did not verify - %s copy differs. Backup kept."
+                            % TARGET_NAME)
     finally:
         close(ftp)
     note = ""
     if len(data) > len(local):
         note = " (padded from %s to the size nds-bootstrap uses)" % kb(len(local))
-    return "Sent %s to 3DS %s and verified%s" % (kb(len(data)), slot_label(slot), note)
+    return "Sent %s to %s %s and verified%s" % (kb(len(data)), TARGET_NAME,
+                                                slot_label(slot), note)
 
 
 def cmd_pull(ip, base, slot):
@@ -286,7 +303,7 @@ def cmd_pull(ip, base, slot):
     finally:
         close(ftp)
     if remote is None:
-        raise SyncError("No save in 3DS %s for that game" % slot_label(slot))
+        raise SyncError("No save in %s %s for that game" % (TARGET_NAME, slot_label(slot)))
     old, _, _ = local_save(base)
     data = remote if old is None else fit(remote, len(old), 0xFF)
     # Back up both formats before touching either; the .dsv is moved away so
@@ -311,13 +328,31 @@ def cmd_pull(ip, base, slot):
         os.remove(dsv_path)  # already copied into BACKUP_DIR above
     note = ""
     if len(data) < len(remote):
-        note = " (3DS file is %s; the rest is empty padding nds-bootstrap adds)" % kb(len(remote))
-    return "Saved %s from 3DS %s and verified%s" % (kb(len(data)), slot_label(slot), note)
+        note = " (%s file is %s; the rest is empty padding nds-bootstrap adds)" % (
+            TARGET_NAME, kb(len(remote)))
+    return "Saved %s from %s %s and verified%s" % (kb(len(data)), TARGET_NAME,
+                                                   slot_label(slot), note)
+
+
+def take_options(argv):
+    """Pull --tag= / --name= out of argv and apply them. Returns the rest."""
+    global TARGET_NAME, TARGET_TAG
+    rest = []
+    for arg in argv:
+        if arg.startswith("--name="):
+            TARGET_NAME = arg[len("--name="):] or TARGET_NAME
+        elif arg.startswith("--tag="):
+            TARGET_TAG = arg[len("--tag="):] or TARGET_TAG
+        else:
+            rest.append(arg)
+    return rest
 
 
 def main(argv):
+    argv = take_options(argv)
     if len(argv) < 3 or argv[1] not in ("ping", "status", "push", "pull"):
-        raise SyncError("usage: syncnds.py ping|status|push|pull <ip> [rom base name] [slot]")
+        raise SyncError("usage: syncnds.py [--tag=T] [--name=N] "
+                        "ping|status|push|pull <ip> [rom base name] [slot]")
     command, ip = argv[1], argv[2]
     if command == "ping":
         return cmd_ping(ip)
