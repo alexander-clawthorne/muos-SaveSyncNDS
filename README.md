@@ -150,10 +150,17 @@ backup filenames. Both default to the 3DS so older command lines still work.
 
 ## Install
 
-Copy the folder to `/mnt/mmc/MUOS/application/SaveSyncNDS/` and make
-`mux_launch.sh` and `syncnds.py` executable. Files must have **LF** line
-endings - a CRLF `mux_launch.sh` fails on the device with
-`env: 'bash\r': No such file or directory`.
+Copy the contents of `app/` to `/mnt/mmc/MUOS/application/SaveSyncNDS/` and the
+two PNGs from `icons/` into `glyph/` and `grid/` beside them, so the launcher
+has an icon. Make `mux_launch.sh` and `syncnds.py` executable.
+
+Files must have **LF** line endings - a CRLF `mux_launch.sh` fails on the
+device with `env: 'bash': No such file or directory`. The `.gitattributes`
+here forces LF on checkout, so a clone is already correct.
+
+`reference/` holds the DraStic config this was developed against, for the
+`backup_use_sav_format` setting that decides whether DraStic writes `.sav` or
+`.dsv`.
 
 ## Notes
 
